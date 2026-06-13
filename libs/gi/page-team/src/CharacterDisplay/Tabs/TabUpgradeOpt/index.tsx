@@ -165,29 +165,29 @@ export default function TabUpopt() {
 
     return (
       artsDirty &&
-        database.arts.values
-          .filter((art) => {
-            const reshapeCandidate = upOptReshape && canReshapeArtifact(art)
-            if (!useExcludedArts && artExclusion.includes(art.id)) return false
-            if (!reshapeCandidate) {
-              if (art.level < upOptLevelLow) return false
-              if (art.level > upOptLevelHigh) return false
-            }
-            const mainStats = mainStatKeys[art.slotKey]
-            if (mainStats?.length && !mainStats.includes(art.mainStatKey))
-              return false
+      database.arts.values
+        .filter((art) => {
+          const reshapeCandidate = upOptReshape && canReshapeArtifact(art)
+          if (!useExcludedArts && artExclusion.includes(art.id)) return false
+          if (!reshapeCandidate) {
+            if (art.level < upOptLevelLow) return false
+            if (art.level > upOptLevelHigh) return false
+          }
+          const mainStats = mainStatKeys[art.slotKey]
+          if (mainStats?.length && !mainStats.includes(art.mainStatKey))
+            return false
 
-            const locKey = charKeyToLocCharKey(characterKey)
-            if (
-              art.location &&
-              art.location !== locKey &&
-              excludedLocations.includes(art.location)
-            )
-              return false
+          const locKey = charKeyToLocCharKey(characterKey)
+          if (
+            art.location &&
+            art.location !== locKey &&
+            excludedLocations.includes(art.location)
+          )
+            return false
 
-            return true
+          return true
         })
-          .filter(filterFunc)
+        .filter(filterFunc)
     )
   }, [optConfig, artsDirty, database, characterKey, filterOption])
   const filteredArtIdMap = useMemo(
@@ -206,7 +206,7 @@ export default function TabUpopt() {
           (!optConfig.mainStatKeys[art.slotKey]?.length ||
             optConfig.mainStatKeys[art.slotKey]?.includes(art.mainStatKey))
       ).length,
-    [artsDirty, database, optConfig.mainStatKeys]
+    [database, optConfig.mainStatKeys]
   )
 
   const { artSetKeys = [], slotKeys = [] } = filterOption
@@ -555,10 +555,7 @@ export default function TabUpopt() {
                             }
                             label="Reshape"
                           />
-                          <SqBadge
-                            color="info"
-                            sx={{ mr: 2 }}
-                          >
+                          <SqBadge color="info" sx={{ mr: 2 }}>
                             {reshapeCandidateCount}
                           </SqBadge>
                           <Tooltip

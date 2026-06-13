@@ -146,7 +146,6 @@ export class OptConfigDataManager extends DataManager<
       levelHigh,
       upOptLevelLow,
       upOptLevelHigh,
-      upOptReshapeRolls,
     } = data
 
     // Business logic: filter artExclusion to only IDs that exist in database
@@ -199,7 +198,6 @@ export class OptConfigDataManager extends DataManager<
       levelHigh,
       upOptLevelLow,
       upOptLevelHigh,
-      upOptReshapeRolls,
     }
   }
   new(data: Partial<OptConfig> = {}) {

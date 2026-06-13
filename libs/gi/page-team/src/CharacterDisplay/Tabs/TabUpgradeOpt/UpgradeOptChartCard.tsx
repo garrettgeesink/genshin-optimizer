@@ -16,6 +16,7 @@ import {
 import {
   ArtifactCard,
   ArtifactCardPico,
+  ArtifactStatWithUnit,
   DataContext,
   EquipBuildModal,
 } from '@genshin-optimizer/gi/ui'
@@ -38,16 +39,23 @@ import {
 import { erf } from './mathUtil'
 import type { UpOptCalculator } from './upOpt'
 import { ResultType } from './upOpt'
+import type { ReshapeDisplayArtifact } from './types'
 
-type Props = {
+type CommonProps = {
   setArtifactIdToEdit: (id: string | undefined) => void
   showTrue?: boolean
   objMin: number
   objMax: number
   thresholds: number[]
+}
+type UpgradeProps = CommonProps & {
   ix: number
   upOptCalc: UpOptCalculator
 }
+type ReshapeProps = CommonProps & {
+  reshapeArtifact: ReshapeDisplayArtifact
+}
+type Props = UpgradeProps | ReshapeProps
 type ChartData = {
   x: number
   est: number
@@ -58,7 +66,10 @@ const nbins = 50
 
 export default function UpgradeOptChartCard(props: Props) {
   const database = useDatabase()
-  const id = props.upOptCalc.artifacts[props.ix]?.id
+  const id =
+    'reshapeArtifact' in props
+      ? props.reshapeArtifact.id
+      : props.upOptCalc.artifacts[props.ix]?.id
   const upArt = database.arts.get(id)
   const { data } = useContext(DataContext)
   const currentlyEquippedArtId =
@@ -144,24 +155,28 @@ function EquipButton({
   )
 }
 
-function UpgradeOptChartCardGraph({
-  thresholds,
-  objMin,
-  objMax,
-  upOptCalc,
-  ix,
-}: Props) {
+function UpgradeOptChartCardGraph(props: Props) {
+  const { thresholds, objMin, objMax } = props
   const { t } = useTranslation('page_character_optimize')
-  const upArt = upOptCalc.artifacts[ix]
+  const upArt =
+    'reshapeArtifact' in props
+      ? props.reshapeArtifact
+      : props.upOptCalc.artifacts[props.ix]
   const [, forceUpdate] = useForceUpdate()
   const equippedArt = useArtifact(upArt.id)
+  const reshapeArtifact =
+    'reshapeArtifact' in props ? props.reshapeArtifact : undefined
+  const upOptCalc = 'reshapeArtifact' in props ? undefined : props.upOptCalc
+  const ix = 'reshapeArtifact' in props ? undefined : props.ix
 
   useEffect(() => {
     if (equippedArt) {
-      upOptCalc.reCalc(ix, equippedArt)
+      if (reshapeArtifact) reshapeArtifact.recalc(equippedArt)
+      else if (upOptCalc !== undefined && ix !== undefined)
+        upOptCalc.reCalc(ix, equippedArt)
       forceUpdate()
     }
-  }, [equippedArt, upOptCalc, ix, forceUpdate])
+  }, [equippedArt, reshapeArtifact, upOptCalc, ix, forceUpdate])
 
   const constrained = thresholds.length > 1
 
@@ -211,12 +226,15 @@ function UpgradeOptChartCardGraph({
   const reportD = upArt.result!.upAvg
   const chartData = dataHist
   const isExact = upArt.result!.evalMode === ResultType.Exact
+  const chartKey =
+    'key' in upArt && typeof upArt.key === 'string' ? upArt.key : upArt.id
 
   useEffect(() => {
     if (isExact) return
-    upOptCalc.calcExact(ix)
+    if (reshapeArtifact) reshapeArtifact.calcExact()
+    else if (upOptCalc !== undefined && ix !== undefined) upOptCalc.calcExact(ix)
     forceUpdate()
-  }, [upOptCalc, isExact, ix, forceUpdate])
+  }, [reshapeArtifact, upOptCalc, ix, isExact, forceUpdate])
 
   const probUpgradeText = (
     <span>
@@ -263,6 +281,22 @@ function UpgradeOptChartCardGraph({
               <Typography>{t('upOptChart.current')}</Typography>
             )}
           </Box>
+          {reshapeArtifact && (
+            <Box display="flex" alignItems="center" gap={1}>
+              <SqBadge color="info">Reshape</SqBadge>
+              <Typography variant="body2">
+                Guaranteed: <strong>{reshapeArtifact.mintotal}</strong> rolls
+                into{' '}
+                <strong>
+                  <ArtifactStatWithUnit statKey={reshapeArtifact.affixes[0]} />
+                </strong>{' '}
+                /{' '}
+                <strong>
+                  <ArtifactStatWithUnit statKey={reshapeArtifact.affixes[1]} />
+                </strong>
+              </Typography>
+            </Box>
+          )}
 
           <Typography>{probUpgradeText}</Typography>
           <Typography>{avgIncText}</Typography>
@@ -273,7 +307,7 @@ function UpgradeOptChartCardGraph({
         width="100%"
         height="100%"
         maxHeight={300}
-        key={upArt.id}
+        key={chartKey}
       >
         <ComposedChart
           data={chartData}
@@ -309,7 +343,7 @@ function UpgradeOptChartCardGraph({
 
           <defs>
             <linearGradient
-              id={`splitOpacity${upArt.id}`}
+              id={`splitOpacity${chartKey}`}
               x1="0"
               y1="0"
               x2={xpercent}
@@ -352,7 +386,7 @@ function UpgradeOptChartCardGraph({
             dataKey="estCons"
             stroke={isExact ? '#f17704' : 'orange'}
             dot={false}
-            fill={`url(#splitOpacity${upArt.id})`}
+            fill={`url(#splitOpacity${chartKey})`}
             opacity={0.5}
             name={
               isExact

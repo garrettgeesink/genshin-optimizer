@@ -1,6 +1,6 @@
 import { AdResponsive } from '@genshin-optimizer/common/ad'
 import { useForceUpdate } from '@genshin-optimizer/common/react-util'
-import { CardThemed } from '@genshin-optimizer/common/ui'
+import { CardThemed, SqBadge } from '@genshin-optimizer/common/ui'
 import {
   bulkCatTotal,
   clamp,
@@ -8,10 +8,10 @@ import {
   notEmpty,
   objKeyMap,
   objPathValue,
-  range,
 } from '@genshin-optimizer/common/util'
 import type { ArtifactSetKey, CharacterKey } from '@genshin-optimizer/gi/consts'
 import {
+  allSubstatKeys,
   allArtifactSetKeys,
   allArtifactSlotKeys,
   charKeyToLocCharKey,
@@ -46,17 +46,28 @@ import {
 } from '@genshin-optimizer/gi/ui'
 import { uiDataForTeam } from '@genshin-optimizer/gi/uidata'
 import { artifactFilterConfigs } from '@genshin-optimizer/gi/util'
+import type { ArtifactBuildData, DynStat } from '@genshin-optimizer/gi/solver'
 import type { NumNode } from '@genshin-optimizer/gi/wr'
-import { dynamicData, mergeData, optimize } from '@genshin-optimizer/gi/wr'
+import {
+  ddx,
+  dynamicData,
+  mergeData,
+  optimize,
+  precompute,
+} from '@genshin-optimizer/gi/wr'
 import AddIcon from '@mui/icons-material/Add'
 import {
   Alert,
   Box,
   ButtonGroup,
+  Checkbox,
   CardContent,
+  FormControlLabel,
   Grid,
   Pagination,
   Skeleton,
+  ToggleButton,
+  ToggleButtonGroup,
   Typography,
 } from '@mui/material'
 import type { ButtonProps } from '@mui/material/Button'
@@ -80,6 +91,8 @@ import { OptCharacterCard } from '../TabOptimize/Components/OptCharacterCard'
 import OptimizationTargetSelector from '../TabOptimize/Components/OptimizationTargetSelector'
 import StatFilterCard from '../TabOptimize/Components/StatFilterCard'
 import { LevelFilter } from './LevelFilter'
+import { buildReshapeArtifacts } from './reshape'
+import type { FullBuildEvaluator } from './types'
 import UpgradeOptChartCard from './UpgradeOptChartCard'
 import { UpOptCalculator } from './upOpt'
 
@@ -117,6 +130,8 @@ export default function TabUpopt() {
   )
 
   const [artifactIdToEdit, setArtifactIdToEdit] = useState<string | undefined>()
+  const [reshapeEnabled, setReshapeEnabled] = useState(true)
+  const [reshapeRolls, setReshapeRolls] = useState<2 | 3 | 4>(2)
 
   const activeCharKey = database.teams.getActiveTeamChar(teamId)!.key
 
@@ -213,7 +228,7 @@ export default function TabUpopt() {
 
   const equippedArts = useLoadoutArtifacts(loadoutDatum)
 
-  const upOptCalc = useMemo(() => {
+  const calcContext = useMemo(() => {
     const {
       statFilters,
       optimizationTarget,
@@ -327,13 +342,39 @@ export default function TabUpopt() {
       workerData,
       ({ path: [p] }) => p !== 'dyn'
     )
+    const toEval = []
+    nodes.forEach((n) => {
+      toEval.push(
+        n,
+        ...allSubstatKeys.map((sub) => ddx(n, (fo) => fo.path[1], sub))
+      )
+    })
+    const evalOpt = optimize(toEval, {}, ({ path: [p] }) => p !== 'dyn')
+    const evalFn = precompute(evalOpt, {}, (f) => f.path[1], 1)
+    const evalFullBuild: FullBuildEvaluator = (stats: DynStat) => {
+      const out = evalFn([{ id: '', values: stats }] as ArtifactBuildData[] & {
+        length: 1
+      })
+      return nodes.map((_, i) => {
+        const ix = i * (1 + allSubstatKeys.length)
+        return {
+          v: out[ix],
+          grads: allSubstatKeys.map((_, si) => out[ix + 1 + si]),
+        }
+      })
+    }
 
-    return new UpOptCalculator(
-      nodes,
-      [-Infinity, ...valueFilter.map((x) => x.minimum)],
-      equippedArts,
-      artifactsToConsider
-    )
+    const thresholds = [-Infinity, ...valueFilter.map((x) => x.minimum)]
+    return {
+      artifactsToConsider,
+      evalFullBuild,
+      upOptCalc: new UpOptCalculator(
+        nodes,
+        thresholds,
+        equippedArts,
+        artifactsToConsider
+      ),
+    }
     /**
      * WARNING:
      * Due to the violatile nature of the calculations above,
@@ -352,6 +393,23 @@ export default function TabUpopt() {
     filteredArts,
     equippedArts,
   ])
+  const upOptCalc = calcContext?.upOptCalc
+  const reshapeArtifactCount = useMemo(
+    () =>
+      calcContext?.artifactsToConsider.filter((art) => art.level === 20).length ??
+      0,
+    [calcContext]
+  )
+  const reshapeArtifacts = useMemo(() => {
+    if (!calcContext || !reshapeEnabled) return []
+    return buildReshapeArtifacts(
+      calcContext.artifactsToConsider,
+      equippedArts,
+      calcContext.evalFullBuild,
+      calcContext.upOptCalc.thresholds,
+      reshapeRolls,
+    )
+  }, [calcContext, equippedArts, reshapeEnabled, reshapeRolls])
 
   // Paging logic
   const [pageIdex, setpageIdex] = useState(0)
@@ -359,52 +417,66 @@ export default function TabUpopt() {
   useEffect(() => {
     // reset paging on new upOptCalc
     setpageIdex(0)
-  }, [upOptCalc])
+  }, [upOptCalc, reshapeEnabled, reshapeRolls])
 
   const artifactsToDisplayPerPage = 5
-  const { indexes, numPages, currentPageIndex, minObj0, maxObj0 } =
+  const { displayItems, numPages, currentPageIndex, minObj0, maxObj0 } =
     useMemo(() => {
       if (!upOptCalc)
         return {
-          indexes: [],
+          displayItems: [],
           numPages: 0,
           currentPageIndex: 0,
-          toShow: 0,
           minObj0: 0,
           maxObj0: 0,
         }
 
-      const numPages = Math.ceil(
-        upOptCalc.artifacts.length / artifactsToDisplayPerPage
+      const upgradeItems = upOptCalc.artifacts.map((artifact, ix) => ({
+        type: 'upgrade' as const,
+        key: `${ix}+${artifact.id}`,
+        result: artifact.result!,
+        ix,
+      }))
+      const reshapeItems = reshapeArtifacts.map((artifact) => ({
+        type: 'reshape' as const,
+        key: artifact.key,
+        result: artifact.result!,
+        artifact,
+      }))
+      const allItems = [...upgradeItems, ...reshapeItems].sort(
+        (a, b) => b.result.p * b.result.upAvg - a.result.p * a.result.upAvg
       )
+      if (!allItems.length)
+        return {
+          displayItems: [],
+          numPages: 0,
+          currentPageIndex: 0,
+          minObj0: upOptCalc.thresholds[0],
+          maxObj0: upOptCalc.thresholds[0],
+        }
+      const numPages = Math.ceil(allItems.length / artifactsToDisplayPerPage)
 
       const currentPageIndex = clamp(pageIdex, 0, numPages - 1)
-      const toShow = upOptCalc.artifacts.slice(
+      const toShow = allItems.slice(
         currentPageIndex * artifactsToDisplayPerPage,
         (currentPageIndex + 1) * artifactsToDisplayPerPage
       )
       const thr = upOptCalc.thresholds[0]
 
       return {
-        indexes: range(
-          currentPageIndex * artifactsToDisplayPerPage,
-          Math.min(
-            (currentPageIndex + 1) * artifactsToDisplayPerPage - 1,
-            upOptCalc.artifacts.length - 1
-          )
-        ),
+        displayItems: toShow,
         numPages,
         currentPageIndex,
         minObj0: toShow.reduce(
-          (a, b) => Math.min(b.result!.distr.lower, a),
+          (a, b) => Math.min(b.result.distr.lower, a),
           thr
         ),
         maxObj0: toShow.reduce(
-          (a, b) => Math.max(b.result!.distr.upper, a),
+          (a, b) => Math.max(b.result.distr.upper, a),
           thr
         ),
       }
-    }, [pageIdex, upOptCalc])
+    }, [pageIdex, reshapeArtifacts, upOptCalc])
   const setPage = useCallback(
     (e, value) => {
       if (!upOptCalc) return
@@ -432,8 +504,10 @@ export default function TabUpopt() {
           </Grid>
           <Grid item>
             <ShowingArt
-              numShowing={indexes.length}
-              total={upOptCalc?.artifacts.length ?? 0}
+              numShowing={displayItems.length}
+              total={
+                (upOptCalc?.artifacts.length ?? 0) + reshapeArtifacts.length
+              }
             />
           </Grid>
         </Grid>
@@ -503,6 +577,52 @@ export default function TabUpopt() {
                       disabled={false}
                       filteredArtIdMap={filteredArtIdMap}
                     />
+                  </CardThemed>
+                  <CardThemed bgt="light">
+                    <CardContent>
+                      <Stack spacing={1}>
+                        <FormControlLabel
+                          control={
+                            <Checkbox
+                              checked={reshapeEnabled}
+                              onChange={(e) =>
+                                setReshapeEnabled(e.target.checked)
+                              }
+                            />
+                          }
+                          label={
+                            <Box display="flex" alignItems="center" gap={1}>
+                              <Typography sx={{ fontWeight: 'bold' }}>
+                                Reshape
+                              </Typography>
+                              <SqBadge color="info">
+                                {reshapeArtifactCount}
+                              </SqBadge>
+                            </Box>
+                          }
+                          sx={{ m: 0 }}
+                        />
+                        <Typography variant="body2" color="text.secondary">
+                          Level 20 artifacts include all 6 guaranteed substat
+                          pairs.
+                        </Typography>
+                        <ToggleButtonGroup
+                          exclusive
+                          fullWidth
+                          size="small"
+                          disabled={!reshapeEnabled}
+                          value={reshapeRolls}
+                          onChange={(_, value) => {
+                            if (value === 2 || value === 3 || value === 4)
+                              setReshapeRolls(value)
+                          }}
+                        >
+                          <ToggleButton value={2}>2 Rolls</ToggleButton>
+                          <ToggleButton value={3}>3 Rolls</ToggleButton>
+                          <ToggleButton value={4}>4 Rolls</ToggleButton>
+                        </ToggleButtonGroup>
+                      </Stack>
+                    </CardContent>
                   </CardThemed>
                 </Grid>
                 {/* 3 */}
@@ -584,7 +704,7 @@ export default function TabUpopt() {
                 allowUpload
               />
             </Suspense>
-            {!upOptCalc?.artifacts.length && (
+            {!upOptCalc?.artifacts.length && !reshapeArtifacts.length && (
               <Alert severity="warning">{t('upOptNoResults')}</Alert>
             )}
             <Suspense
@@ -596,19 +716,27 @@ export default function TabUpopt() {
               }
             >
               {!!upOptCalc &&
-                indexes.map(
-                  (i) =>
-                    upOptCalc.artifacts[i] && (
-                      <UpgradeOptChartCard
-                        key={`${i}+${upOptCalc.artifacts[i].id}`}
-                        upOptCalc={upOptCalc}
-                        ix={i}
-                        setArtifactIdToEdit={setArtifactIdToEdit}
-                        thresholds={upOptCalc.thresholds ?? []}
-                        objMax={maxObj0}
-                        objMin={minObj0}
-                      />
-                    )
+                displayItems.map((item) =>
+                  item.type === 'upgrade' ? (
+                    <UpgradeOptChartCard
+                      key={item.key}
+                      upOptCalc={upOptCalc}
+                      ix={item.ix}
+                      setArtifactIdToEdit={setArtifactIdToEdit}
+                      thresholds={upOptCalc.thresholds ?? []}
+                      objMax={maxObj0}
+                      objMin={minObj0}
+                    />
+                  ) : (
+                    <UpgradeOptChartCard
+                      key={item.key}
+                      reshapeArtifact={item.artifact}
+                      setArtifactIdToEdit={setArtifactIdToEdit}
+                      thresholds={upOptCalc.thresholds ?? []}
+                      objMax={maxObj0}
+                      objMin={minObj0}
+                    />
+                  )
                 )}
             </Suspense>
             {pagination}

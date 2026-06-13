@@ -54,7 +54,7 @@ export function levelUpArtifact(
   if (art.unactivatedSubstats) {
     art.unactivatedSubstats.forEach(({ key, value }) => {
       if (key === '') return
-      info.base[key] = (info.base[key] ?? 0) + value
+      info.base[key] = (info.base[key] ?? 0) + toDecimal(key, value)
       info.subkeys.push({ key, baseRolls: 0 })
       info.rollsLeft -= 1
     })
@@ -137,14 +137,16 @@ export function dustReshape(
 ): weightedNode[] {
   const base = toStats(currentBuild, art)
   const { rarity } = art
-  const rollsLeft = getRollsRemaining(0, art.rarity)
   const subkeys = art.substats.flatMap(({ key, initialValue }) => {
     if (key === '') return []
     if (initialValue === undefined)
       throw new Error('initialValue must be defined for reshaping')
-    base[key] = (base[key] ?? 0) + initialValue
+    base[key] = (base[key] ?? 0) + toDecimal(key, initialValue)
     return [{ key, baseRolls: 0 }]
   })
+  const totalRolls =
+    art.totalRolls ?? subkeys.length + getRollsRemaining(0, art.rarity)
+  const rollsLeft = Math.max(0, totalRolls - subkeys.length)
   return [
     {
       p: 1,
@@ -205,9 +207,15 @@ function artToStats(art: ICachedArtifact, mainStatMax = true) {
       mainStatMax ? artMaxLevel[art.rarity] : art.level
     )
   } else {
-    stats[art.mainStatKey] = art.mainStatVal
+    stats[art.mainStatKey] = getMainStatValue(
+      art.mainStatKey,
+      art.rarity,
+      art.level
+    )
   }
-  art.substats.forEach(({ key, value }) => (stats[key] = value))
+  art.substats.forEach(({ key, accurateValue }) => {
+    stats[key] = toDecimal(key, accurateValue)
+  })
   stats[art.setKey] = 1
   return stats
 }
@@ -245,12 +253,16 @@ function toStats(
 
 function getSubkeys(art: ICachedArtifact) {
   const subkeys = art.substats.map(({ key }) => key).filter((key) => key !== '') // Filter out empty substats
-  const stats = art.substats.reduce((acc, { key, value }) => {
+  const stats = art.substats.reduce((acc, { key, accurateValue }) => {
     if (key === '') return acc
-    acc[key] = value
+    acc[key] = toDecimal(key, accurateValue)
     return acc
   }, {} as DynStat)
   return { subkeys, stats }
+}
+
+function toDecimal(key: MainStatKey | SubstatKey | '', value: number) {
+  return key.endsWith('_') ? value / 100 : value
 }
 
 type Build = Record<ArtifactSlotKey, ICachedArtifact | undefined>

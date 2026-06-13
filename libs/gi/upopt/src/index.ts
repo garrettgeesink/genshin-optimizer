@@ -1,3 +1,5 @@
 export * from './upOpt'
+export type { MarkovNode, ValuesLevelNode } from './upOpt.types'
+export { deduplicate } from './deduplicate'
 export { evalMarkovNode } from './markov-tree/evaluation'
 export * from './markov-tree/makeObjective'

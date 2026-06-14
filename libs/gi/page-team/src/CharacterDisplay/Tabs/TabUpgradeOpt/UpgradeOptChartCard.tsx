@@ -41,7 +41,6 @@ import { ResultType } from './upOpt'
 
 type Props = {
   setArtifactIdToEdit: (id: string | undefined) => void
-  showTrue?: boolean
   objMin: number
   objMax: number
   thresholds: number[]
@@ -58,20 +57,24 @@ const nbins = 50
 
 export default function UpgradeOptChartCard(props: Props) {
   const database = useDatabase()
-  const id = props.upOptCalc.artifacts[props.ix]?.id
-  const upArt = database.arts.get(id)
+  const upOptArt = props.upOptCalc.artifacts[props.ix]
   const { data } = useContext(DataContext)
+  if (!upOptArt) return null
+  const artifactId = upOptArt.artifactId
+  const upArt = database.arts.get(artifactId)
   const currentlyEquippedArtId =
     upArt?.slotKey && data.get(input.art[upArt.slotKey].id).value
-  const isEquipped = id === currentlyEquippedArtId
+  const isEquipped = artifactId === currentlyEquippedArtId
   return (
     <Box>
       <Grid container spacing={1}>
         <Grid item xs={12} sm={5} md={4} lg={3} xl={3}>
           <ArtifactCard
-            artifactId={id}
-            onEdit={() => props.setArtifactIdToEdit(id)}
-            extraButtons={<EquipButton newArtId={id} disabled={isEquipped} />}
+            artifactId={artifactId}
+            onEdit={() => props.setArtifactIdToEdit(artifactId)}
+            extraButtons={
+              <EquipButton newArtId={artifactId} disabled={isEquipped} />
+            }
           />
         </Grid>
         <Grid item xs={12} sm={7} md={8} lg={9} xl={9}>
@@ -152,9 +155,15 @@ function UpgradeOptChartCardGraph({
   ix,
 }: Props) {
   const { t } = useTranslation('page_character_optimize')
+  const { t: tk } = useTranslation('statKey_gen')
+  const formatReshapeLabel = useCallback(
+    (key: string) =>
+      `${tk(key)}${['atk_', 'def_', 'hp_'].includes(key) ? '%' : ''}`,
+    [tk]
+  )
   const upArt = upOptCalc.artifacts[ix]
   const [, forceUpdate] = useForceUpdate()
-  const equippedArt = useArtifact(upArt.id)
+  const equippedArt = useArtifact(upArt.artifactId)
 
   useEffect(() => {
     if (equippedArt) {
@@ -236,7 +245,15 @@ function UpgradeOptChartCardGraph({
   const { data } = useContext(DataContext)
   const currentlyEquippedArtId =
     equippedArt?.slotKey && data.get(input.art[equippedArt.slotKey].id).value
-  const isCurrentlyEquipped = currentlyEquippedArtId === upArt.id
+  const isCurrentlyEquipped = currentlyEquippedArtId === upArt.artifactId
+  const reshapeLabel =
+    upArt.action.type === 'reshape'
+      ? upArt.action.affixes
+          .map((affix) => formatReshapeLabel(affix))
+          .join(' / ')
+      : ''
+  const reshapeRolls =
+    upArt.action.type === 'reshape' ? upArt.action.mintotal : undefined
   return (
     <CardThemed bgt="light" sx={{ height: '100%' }}>
       <Box sx={{ display: 'flex', flexDirection: 'row' }}>
@@ -261,6 +278,19 @@ function UpgradeOptChartCardGraph({
               <SqBadge color="secondary">{t('upOptChart.equipped')}</SqBadge>
             ) : (
               <Typography>{t('upOptChart.current')}</Typography>
+            )}
+          </Box>
+          <Box display="flex" alignItems="center" gap={1}>
+            {upArt.action.type === 'reshape' && (
+              <>
+                <SqBadge color="secondary">{t('upOptChart.reshape')}</SqBadge>
+                <Typography variant="body2">
+                  {t('upOptChart.reshapeStats', {
+                    stats: reshapeLabel,
+                    count: reshapeRolls,
+                  })}
+                </Typography>
+              </>
             )}
           </Box>
 

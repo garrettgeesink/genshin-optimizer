@@ -115,6 +115,8 @@ const optConfigSchema = z.object({
   generatedBuildListId: z.string().optional().catch(undefined),
   upOptLevelLow: zodClampedNumber(0, 20, 0),
   upOptLevelHigh: zodClampedNumber(0, 20, 19),
+  upOptReshape: zodBoolean(),
+  upOptReshapeRolls: zodClampedNumber(2, 4, 2),
 })
 export type OptConfig = z.infer<typeof optConfigSchema>
 

@@ -1,6 +1,7 @@
 import { cartesian, objMap, range } from '@genshin-optimizer/common/util'
 import type {
   ArtifactRarity,
+  ArtifactSetKey,
   ArtifactSlotKey,
 } from '@genshin-optimizer/gi/consts'
 import { allSubstatKeys, artMaxLevel } from '@genshin-optimizer/gi/consts'
@@ -10,6 +11,7 @@ import type { ArtifactBuildData, DynStat } from '@genshin-optimizer/gi/solver'
 import {
   deduplicate,
   dustReshape,
+  elixirDefinition,
   evalMarkovNode,
   expandNode,
   makeObjective,
@@ -99,6 +101,17 @@ export type UpOptAction =
       affixes: [SubstatKey, SubstatKey]
       mintotal: 2 | 3 | 4
     }
+  | {
+      type: 'define'
+      setKey: ArtifactSetKey
+      affixes: [SubstatKey, SubstatKey]
+    }
+export type UpOptDefinition = {
+  setKey: ArtifactSetKey
+  slotKey: ArtifactSlotKey
+  mainStatKey: MainStatKey
+  affixes: [SubstatKey, SubstatKey]
+}
 export type UpOptArtifact = {
   id: string
   artifactId: string
@@ -107,7 +120,8 @@ export type UpOptArtifact = {
   subs: SubstatKey[]
   values: DynStat
   slotKey: ArtifactSlotKey
-  sourceArt: ICachedArtifact
+  sourceArt?: ICachedArtifact
+  displayArt: ICachedArtifact
   action: UpOptAction
 
   result?: UpOptResult
@@ -129,6 +143,50 @@ type GaussianMixture = {
   // Store estimates of left and right bounds of distribution for visualization.
   lower: number
   upper: number
+}
+type GaussianNode = {
+  base: DynStat
+  subs: SubstatKey[]
+  mu: number[]
+  cov: number[][]
+}
+type WeightedGaussianNode = { p: number; n: { subDistr: GaussianNode } }
+type WeightedMarkovNode = { p: number; n: Parameters<typeof expandNode>[0] }
+
+function statKey(stats: DynStat) {
+  return Object.keys(stats)
+    .sort()
+    .map((key) => `${key}:${stats[key]}`)
+    .join('|')
+}
+
+function deduplicateValueNodes(nodes: WeightedMarkovNode[]) {
+  const merged = new Map<string, WeightedMarkovNode>()
+  nodes.forEach((node) => {
+    const key = statKey(node.n.subDistr.base)
+    const existing = merged.get(key)
+    if (existing) existing.p += node.p
+    else merged.set(key, node)
+  })
+  return [...merged.values()]
+}
+
+function deduplicateExactDefinitionNodes(
+  obj: ReturnType<typeof makeObjective>,
+  nodes: WeightedMarkovNode[]
+) {
+  return nodes.every(({ n }) => n.type === 'values')
+    ? deduplicateValueNodes(nodes)
+    : (deduplicate(obj, nodes) as WeightedMarkovNode[])
+}
+
+function yieldToUi() {
+  return new Promise<void>((resolve) => setTimeout(resolve, 0))
+}
+
+const uiYieldBudgetMs = 12
+function shouldYieldToUi(lastYield: number) {
+  return Date.now() - lastYield >= uiYieldBudgetMs
 }
 
 // TODO: put this into a `constants` files somewhere.
@@ -154,6 +212,34 @@ function scale(key: SubstatKey, rarity: ArtifactRarity = 5) {
 /* Fixes silliness with percents and being multiplied by 100. */
 function toDecimal(key: SubstatKey | MainStatKey | '', value: number) {
   return key.endsWith('_') ? value / 100 : value
+}
+
+function aggregateGaussianNodes(nodes: WeightedGaussianNode[]): GaussianNode {
+  const totalP = nodes.reduce((sum, { p }) => sum + p, 0)
+  const base = nodes[0]?.n.subDistr.base ?? {}
+  const subs = allSubstatKeys.filter((key) =>
+    nodes.some(({ n }) => n.subDistr.subs.includes(key))
+  )
+  const mu = subs.map((key) =>
+    nodes.reduce((sum, { p, n }) => {
+      const ix = n.subDistr.subs.indexOf(key)
+      return sum + (totalP ? p / totalP : 0) * (ix < 0 ? 0 : n.subDistr.mu[ix])
+    }, 0)
+  )
+  const cov = subs.map((keyA, i) =>
+    subs.map((keyB, j) =>
+      nodes.reduce((sum, { p, n }) => {
+        const weight = totalP ? p / totalP : 0
+        const ixA = n.subDistr.subs.indexOf(keyA)
+        const ixB = n.subDistr.subs.indexOf(keyB)
+        const muA = ixA < 0 ? 0 : n.subDistr.mu[ixA]
+        const muB = ixB < 0 ? 0 : n.subDistr.mu[ixB]
+        const covAB = ixA < 0 || ixB < 0 ? 0 : (n.subDistr.cov[ixA]?.[ixB] ?? 0)
+        return sum + weight * (covAB + (muA - mu[i]) * (muB - mu[j]))
+      }, 0)
+    )
+  )
+  return { base, subs, mu, cov }
 }
 
 function getReshapeSubstatKeys(art: ICachedArtifact): SubstatKey[] {
@@ -197,6 +283,45 @@ function canReshapeArtifactWithAffixes(
   return reshapeAffixes.every((key) => substatKeys.includes(key))
 }
 
+function makeDefinitionArtifact(info: UpOptDefinition): ICachedArtifact {
+  const { setKey, slotKey, mainStatKey, affixes } = info
+  const id = `define:${setKey}:${slotKey}:${mainStatKey}:${affixes.join(',')}`
+  const avgInitialRoll = (key: SubstatKey) => getSubstatValue(key, 5) * 0.85
+  const substats = [
+    ...affixes.map((key) => {
+      const value = avgInitialRoll(key)
+      return {
+        key,
+        value,
+        accurateValue: value,
+        efficiency: value / getSubstatValue(key, 5),
+        rolls: [],
+      }
+    }),
+    ...range(0, 1).map(() => ({
+      key: '' as const,
+      value: 0,
+      accurateValue: 0,
+      efficiency: 0,
+      rolls: [],
+    })),
+  ]
+  return {
+    id,
+    setKey,
+    slotKey,
+    mainStatKey,
+    rarity: 5,
+    level: 0,
+    lock: false,
+    location: '',
+    substats,
+    mainStatVal: 0,
+    unactivatedSubstats: undefined,
+    elixirCrafted: true,
+  }
+}
+
 export class UpOptCalculator {
   /**
    * Calculator class to track artifacts and their evaluation status. Method overview:
@@ -212,6 +337,7 @@ export class UpOptCalculator {
   reshapeEnabled: boolean
   reshapeMintotal: 2 | 3 | 4
   markovObjective: ReturnType<typeof makeObjective>
+  evalMarkovValues: (stats: DynStat) => number[]
 
   skippableDerivatives: boolean[]
   eval: (
@@ -234,6 +360,7 @@ export class UpOptCalculator {
     thresholds: number[],
     equippedBuild: Record<ArtifactSlotKey, ICachedArtifact | undefined>,
     artifacts: ICachedArtifact[],
+    definitions: UpOptDefinition[] = [],
     calc4th = true,
     reshapeEnabled = false,
     reshapeMintotal: 2 | 3 | 4 = 2
@@ -262,6 +389,16 @@ export class UpOptCalculator {
       Object.values(this.baseBuild) as ArtifactBuildData[] & { length: 5 }
     )[0] // dmg threshold is current objective value
     this.markovObjective = makeObjective(nodes, thresholds)
+    const markovValueFn = precompute(
+      optimize(nodes, {}, ({ path: [p] }) => p !== 'dyn'),
+      {},
+      (f) => f.path[1],
+      1
+    )
+    this.evalMarkovValues = (stats: DynStat) =>
+      markovValueFn([{ id: '', values: stats }] as ArtifactBuildData[] & {
+        length: 1
+      })
 
     this.skippableDerivatives = allSubstatKeys.map((sub) =>
       nodes.every((n) => zero_deriv(n, (f) => f.path[1], sub))
@@ -281,6 +418,7 @@ export class UpOptCalculator {
     }
 
     artifacts.forEach((art) => this._addArtifact(art))
+    definitions.forEach((definition) => this._addDefinition(definition))
 
     // Do all fast calc
     this.initCalc()
@@ -301,6 +439,9 @@ export class UpOptCalculator {
     }
     this.artifacts.push(this.toUpOptArtifact(art, { type: 'upgrade' }))
   }
+  _addDefinition(definition: UpOptDefinition) {
+    this.artifacts.push(this.toUpOptDefinition(definition))
+  }
   toUpOptArtifact(art: ICachedArtifact, action: UpOptAction): UpOptArtifact {
     const maxLevel = artMaxLevel[art.rarity]
     const mainStatVal = getMainStatValue(art.mainStatKey, art.rarity, maxLevel) // 5* only
@@ -315,6 +456,7 @@ export class UpOptCalculator {
       slotKey: art.slotKey,
       mainStat: art.mainStatKey,
       sourceArt: art,
+      displayArt: art,
       action,
       subs: art.substats
         .map(({ key }) => key)
@@ -341,6 +483,28 @@ export class UpOptCalculator {
       })
     }
     return out
+  }
+  toUpOptDefinition(definition: UpOptDefinition): UpOptArtifact {
+    const displayArt = makeDefinitionArtifact(definition)
+    const mainStatVal = getMainStatValue(definition.mainStatKey, 5, 20)
+    return {
+      id: displayArt.id,
+      artifactId: displayArt.id,
+      rollsLeft: getRollsRemaining(0, 5),
+      slotKey: definition.slotKey,
+      mainStat: definition.mainStatKey,
+      displayArt,
+      action: {
+        type: 'define',
+        setKey: definition.setKey,
+        affixes: definition.affixes,
+      },
+      subs: definition.affixes,
+      values: {
+        [definition.setKey]: 1,
+        [definition.mainStatKey]: mainStatVal,
+      },
+    }
   }
   reCalc(ix: number, art: ICachedArtifact) {
     const prevAction = this.artifacts[ix].action
@@ -484,6 +648,10 @@ export class UpOptCalculator {
       this._calcReshape(ix)
       return
     }
+    if (this.artifacts[ix].action.type === 'define') {
+      this._calcDefinition(ix)
+      return
+    }
     if (this.artifacts[ix].subs.length === 4) calc4th = false
     if (calc4th) this._calcFast4th(ix)
     else this._calcFast(ix)
@@ -498,7 +666,7 @@ export class UpOptCalculator {
     const weighted = deduplicate(
       this.markovObjective,
       dustReshape(
-        this.artifacts[ix].sourceArt,
+        this.artifacts[ix].sourceArt!,
         this.equippedBuild,
         affixes,
         mintotal
@@ -510,6 +678,33 @@ export class UpOptCalculator {
         evaluation: evalMarkovNode(this.markovObjective, n).evaluation,
       }))
     )
+  }
+
+  _calcDefinition(ix: number) {
+    const action = this.artifacts[ix].action
+    if (action.type !== 'define') return
+    const weighted = deduplicate(
+      this.markovObjective,
+      elixirDefinition(
+        {
+          setKey: action.setKey,
+          slotKey: this.artifacts[ix].slotKey,
+          mainStatKey: this.artifacts[ix].mainStat,
+          affixes: action.affixes,
+        },
+        this.equippedBuild
+      )
+    )
+    const subDistr = aggregateGaussianNodes(weighted)
+    this.artifacts[ix].result = this._toResultMarkov([
+      {
+        prob: 1,
+        evaluation: evalMarkovNode(this.markovObjective, {
+          type: 'values',
+          subDistr,
+        }).evaluation,
+      },
+    ])
   }
 
   /**
@@ -628,7 +823,11 @@ export class UpOptCalculator {
       this.artifacts[ix].result?.evalMode === ResultType.Exact
     )
       return
-    if (this.artifacts[ix].action.type === 'reshape') return
+    if (
+      this.artifacts[ix].action.type === 'reshape' ||
+      this.artifacts[ix].action.type === 'define'
+    )
+      return
     if (this.artifacts[ix].subs.length === 4) calc4th = false
     if (calc4th) this._calcSlow4th(ix)
     else this._calcSlow(ix)
@@ -728,15 +927,21 @@ export class UpOptCalculator {
         upAvgtot += prob * (val[0] - this.thresholds[0])
         return { phi: prob, cp: 1, mu: val[0], sig2: 0 }
       }
-      const consOK = val.slice(1).every((vi, i) => vi >= this.thresholds[i])
+      const consOK = val.slice(1).every((vi, i) => vi >= this.thresholds[i + 1])
       return { phi: prob, cp: consOK ? 1 : 0, mu: val[0], sig2: 0 }
     })
 
-    const vals = gmm.map(({ mu }) => mu)
+    const { lower, upper } = gmm.reduce(
+      (bounds, { mu }) => ({
+        lower: Math.min(bounds.lower, mu),
+        upper: Math.max(bounds.upper, mu),
+      }),
+      { lower: Infinity, upper: -Infinity }
+    )
     return {
       p: ptot,
       upAvg: ptot < 1e-6 ? 0 : upAvgtot / ptot,
-      distr: { gmm, lower: Math.min(...vals), upper: Math.max(...vals) },
+      distr: { gmm, lower, upper },
       evalMode: ResultType.Exact,
     }
   }
@@ -749,6 +954,10 @@ export class UpOptCalculator {
     if (this.artifacts[ix].result?.evalMode === ResultType.Exact) return
     if (this.artifacts[ix].action.type === 'reshape') {
       this._calcExactReshape(ix)
+      return
+    }
+    if (this.artifacts[ix].action.type === 'define') {
+      this._calcExactDefinition(ix)
       return
     }
     if (this.artifacts[ix].subs.length === 4) calc4th = false
@@ -765,14 +974,14 @@ export class UpOptCalculator {
     let weighted = deduplicate(
       this.markovObjective,
       dustReshape(
-        this.artifacts[ix].sourceArt,
+        this.artifacts[ix].sourceArt!,
         this.equippedBuild,
         affixes,
         mintotal
       )
     )
     while (weighted.some(({ n }) => n.type !== 'values')) {
-      weighted = deduplicate(
+      weighted = deduplicateExactDefinitionNodes(
         this.markovObjective,
         weighted.flatMap(({ p, n }) =>
           expandNode(n).map(({ p: p2, n: expanded }) => ({
@@ -786,9 +995,153 @@ export class UpOptCalculator {
     this.artifacts[ix].result = this._toResultExact(
       weighted.map(({ p, n }) => ({
         prob: p,
-        val: evalMarkovNode(this.markovObjective, n).evaluation.f_mu,
+        val: this.evalMarkovValues(n.subDistr.base),
       }))
     )
+  }
+
+  _calcExactDefinition(ix: number) {
+    const action = this.artifacts[ix].action
+    if (action.type !== 'define') return
+    let weighted = deduplicate(
+      this.markovObjective,
+      elixirDefinition(
+        {
+          setKey: action.setKey,
+          slotKey: this.artifacts[ix].slotKey,
+          mainStatKey: this.artifacts[ix].mainStat,
+          affixes: action.affixes,
+        },
+        this.equippedBuild
+      )
+    )
+    while (weighted.some(({ n }) => n.type !== 'values')) {
+      weighted = deduplicateExactDefinitionNodes(
+        this.markovObjective,
+        weighted.flatMap(({ p, n }) =>
+          expandNode(n).map(({ p: p2, n: expanded }) => ({
+            p: p * p2,
+            n: expanded,
+          }))
+        )
+      )
+    }
+
+    this.artifacts[ix].result = this._toResultExact(
+      weighted.map(({ p, n }) => ({
+        prob: p,
+        val: this.evalMarkovValues(n.subDistr.base),
+      }))
+    )
+  }
+
+  async calcExactDefinitionAsync(
+    ix: number,
+    shouldCancel: () => boolean = () => false
+  ) {
+    if (this.artifacts[ix].result?.evalMode === ResultType.Exact) return true
+    const action = this.artifacts[ix].action
+    if (action.type !== 'define') return false
+
+    await yieldToUi()
+    if (shouldCancel()) return false
+    let lastYield = Date.now()
+
+    let weighted = deduplicate(
+      this.markovObjective,
+      elixirDefinition(
+        {
+          setKey: action.setKey,
+          slotKey: this.artifacts[ix].slotKey,
+          mainStatKey: this.artifacts[ix].mainStat,
+          affixes: action.affixes,
+        },
+        this.equippedBuild
+      )
+    ) as WeightedMarkovNode[]
+
+    while (weighted.some(({ n }) => n.type !== 'values')) {
+      if (shouldCancel()) return false
+      const expanded: WeightedMarkovNode[] = []
+      for (let i = 0; i < weighted.length; i++) {
+        const { p, n } = weighted[i]
+        expandNode(n).forEach(({ p: p2, n: expandedNode }) =>
+          expanded.push({ p: p * p2, n: expandedNode })
+        )
+        if (shouldYieldToUi(lastYield)) {
+          if (shouldCancel()) return false
+          await yieldToUi()
+          lastYield = Date.now()
+        }
+      }
+      if (shouldCancel()) return false
+      weighted = deduplicateExactDefinitionNodes(this.markovObjective, expanded)
+      if (shouldYieldToUi(lastYield)) {
+        await yieldToUi()
+        lastYield = Date.now()
+      }
+    }
+
+    const result = await this._toResultExactWeightedAsync(
+      weighted,
+      shouldCancel
+    )
+    if (!result || shouldCancel()) return false
+    this.artifacts[ix].result = result
+    return true
+  }
+
+  async _toResultExactWeightedAsync(
+    weighted: WeightedMarkovNode[],
+    shouldCancel: () => boolean
+  ): Promise<UpOptResult | undefined> {
+    let ptot = 0
+    let upAvgtot = 0
+    let lower = Infinity
+    let upper = -Infinity
+    const gmm: GaussianMixture['gmm'] = []
+    let lastYield = Date.now()
+
+    for (let i = 0; i < weighted.length; i++) {
+      if (shouldCancel()) return undefined
+      const { p: prob, n } = weighted[i]
+      const val = this.evalMarkovValues(n.subDistr.base)
+      const mu = val[0]
+      lower = Math.min(lower, mu)
+      upper = Math.max(upper, mu)
+      let pass = true
+      for (let j = 0; j < this.thresholds.length; j++) {
+        if (val[j] < this.thresholds[j]) {
+          pass = false
+          break
+        }
+      }
+      if (pass) {
+        ptot += prob
+        upAvgtot += prob * (mu - this.thresholds[0])
+        gmm.push({ phi: prob, cp: 1, mu, sig2: 0 })
+      } else {
+        let consOK = true
+        for (let j = 1; j < this.thresholds.length; j++) {
+          if (val[j] < this.thresholds[j]) {
+            consOK = false
+            break
+          }
+        }
+        gmm.push({ phi: prob, cp: consOK ? 1 : 0, mu, sig2: 0 })
+      }
+      if (shouldYieldToUi(lastYield)) {
+        await yieldToUi()
+        lastYield = Date.now()
+      }
+    }
+
+    return {
+      p: ptot,
+      upAvg: ptot < 1e-6 ? 0 : upAvgtot / ptot,
+      distr: { gmm, lower, upper },
+      evalMode: ResultType.Exact,
+    }
   }
 
   /**
